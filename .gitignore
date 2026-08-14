@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 配置/密钥(绝不提交真实 key)
+.env
+config.local.py
+*.local.py
+*_key.txt
+
+# 临时/输出
+tmp/
+temp/
+output/
+crops/
+*.png.tmp
+
+# 系统
+.DS_Store
+Thumbs.db
