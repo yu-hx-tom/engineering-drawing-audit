@@ -102,6 +102,22 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(set(clusters), {root["id"]})
         self.assertEqual(consumed, {root["id"], numerator["id"], denominator["id"], quote["id"]})
 
+    def test_radius_prefix_is_canonical_root_for_following_stacked_fraction(self):
+        radius = token("R3", size=10.05, bbox=(100, 103, 112, 119))
+        numerator = token("5", size=10.76, bbox=(114, 96, 120, 110))
+        numerator["id"] = "P1-T0002"
+        denominator = token("8", size=10.78, bbox=(114, 110, 120, 124))
+        denominator["id"] = "P1-T0003"
+        quote = token('"', size=13.47, bbox=(124, 103, 130, 119))
+        quote["id"] = "P1-T0004"
+        tokens = [radius, numerator, denominator, quote]
+        clusters, consumed = ledger.detect_imperial_fraction_clusters(tokens)
+        self.assertEqual(set(clusters), {radius["id"]})
+        self.assertEqual(consumed, {token["id"] for token in tokens})
+        parsed = ledger.parse_annotation(radius, clusters[radius["id"]], "mm")
+        self.assertEqual(parsed["raw_text"], 'R3 5/8"')
+        self.assertEqual((parsed["type"], parsed["nominal"], parsed["unit"]), ("radius", 3.625, "in"))
+
     def test_imperial_fraction_tolerance_unit_is_inches(self):
         parsed = self.parse('Ø3 5/8" ±1/16"')
         self.assertEqual((parsed["nominal"], parsed["tolerance_upper"], parsed["tolerance_lower"]), (3.625, 0.0625, -0.0625))

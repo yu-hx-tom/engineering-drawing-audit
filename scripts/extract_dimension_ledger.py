@@ -1290,7 +1290,33 @@ def detect_imperial_fraction_clusters(
                     and abs(token_v - quote_v) <= size * 0.48
                 ):
                     whole_options.append((pair_u - token_u, token))
-            root = min(whole_options, key=lambda item: (item[0], item[1]["id"]))[1] if whole_options else numerator
+            prefixed_whole_options: list[tuple[float, dict[str, Any]]] = []
+            if not whole_options:
+                pair_box = bbox_union((numerator["bbox"], denominator["bbox"]))
+                pair_u_range = local_range(pair_box, u)
+                for token in page_tokens:
+                    if token["id"] in {numerator["id"], denominator["id"], quote["id"]} or token["id"] in consumed:
+                        continue
+                    if not compatible_rotation(quote, token):
+                        continue
+                    if not re.fullmatch(r"(?:SR|R)\s*\d+", token["normalized_text"], re.I):
+                        continue
+                    token_u_range = local_range(token["bbox"], u)
+                    token_u = sum(token_u_range) / 2
+                    token_v = sum(local_range(token["bbox"], v)) / 2
+                    if (
+                        token_u < pair_u - size * 0.25
+                        and pair_u - token_u <= size * 2.7
+                        and interval_gap(token_u_range, pair_u_range) <= size * 0.75
+                        and abs(token_v - quote_v) <= size * 0.48
+                    ):
+                        prefixed_whole_options.append((pair_u - token_u, token))
+            if whole_options:
+                root = min(whole_options, key=lambda item: (item[0], item[1]["id"]))[1]
+            elif prefixed_whole_options:
+                root = min(prefixed_whole_options, key=lambda item: (item[0], item[1]["id"]))[1]
+            else:
+                root = numerator
             fraction_tokens = [numerator, denominator]
         else:
             # A span like ``4 3`` contains the whole and numerator together.
