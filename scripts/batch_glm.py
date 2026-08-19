@@ -7,6 +7,7 @@
 用法:
     python batch_glm.py <img1> <img2> ... [--workers N] [--extra "补充指令"]
     python batch_glm.py <dir> --glob "*.png" [--workers N]
+    python batch_glm.py <img1> ... --terse --extra "查精度"   # 精简定向模式(省 token)
 
 输出: 每张图一行 JSON {img, success, elapsed_s, desc_len, desc_preview}
       (并行数默认 = 4; GLM API 并发 round4 已实测 4 路可行)
@@ -19,9 +20,13 @@ import sys
 import time
 from pathlib import Path
 
-SCRIPTS_DIR = Path(__file__).resolve().parent
-PROMPT_FILE = Path(__file__).resolve().parent.parent / "prompts" / "engineering-drawing.txt"
-VISUALS_SCRIPTS = SCRIPTS_DIR
+SKILLS_ROOT = Path(__file__).resolve().parent.parent.parent
+PROMPT_FILE = SKILLS_ROOT / "visuals-skill" / "prompts" / "engineering-drawing.txt"
+TERSE_PROMPT_FILE = SKILLS_ROOT / "visuals-skill" / "prompts" / "engineering-drawing-terse.txt"
+VISUALS_SCRIPTS = SKILLS_ROOT / "visuals-skill" / "scripts"
+
+# 精简模式默认输出上限
+TERSE_MAX_TOKENS = 800
 
 
 def main():
@@ -34,6 +39,9 @@ def main():
     ap.add_argument("--glob", default="*.png", help="目录模式")
     ap.add_argument("--workers", type=int, default=4, help="并行数(默认4)")
     ap.add_argument("--extra", default="", help="追加指令")
+    ap.add_argument("--terse", action="store_true",
+                    help="精简定向模式: 用 engineering-drawing-terse.txt, 只答目标标注不遍历全图, 并压低输出 token(用于差异项定向核验/反向查证)")
+    ap.add_argument("--max-tokens", type=int, default=None, help="覆盖输出 token 上限(默认完整模式 4096 / 精简模式 800)")
     ap.add_argument("--out-dir", default="", help="保存每张图完整 desc 到 <dir>/<img>.desc.txt")
     args = ap.parse_args()
 
@@ -55,8 +63,10 @@ def main():
         sys.exit(1)
 
     # 提示词
-    base = PROMPT_FILE.read_text(encoding="utf-8")
+    prompt_file = TERSE_PROMPT_FILE if args.terse else PROMPT_FILE
+    base = prompt_file.read_text(encoding="utf-8")
     prompt = (base + "\n\n" + args.extra).strip() if args.extra else base
+    out_tokens = args.max_tokens if args.max_tokens is not None else (TERSE_MAX_TOKENS if args.terse else None)
 
     sys.path.insert(0, str(VISUALS_SCRIPTS))
     from config import load_config
@@ -66,7 +76,7 @@ def main():
 
     def one(img: Path):
         t0 = time.time()
-        r = call_glm_vision(str(img), config, prompt)
+        r = call_glm_vision(str(img), config, prompt, max_tokens=out_tokens)
         dt = round(time.time() - t0, 1)
         desc = r.get("description", "") if r.get("success") else r.get("error", "")
         # 保存完整 desc 到 out-dir

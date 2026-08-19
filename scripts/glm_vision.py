@@ -41,9 +41,11 @@ def encode_image_base64(image_path):
     return b64, image_format
 
 
-def call_glm_vision(image_path, config, custom_prompt=None):
+def call_glm_vision(image_path, config, custom_prompt=None, max_tokens=None):
     """调用GLM视觉API，返回结构化描述
 
+    max_tokens: 覆盖 config 的 glm_max_tokens(用于精简模式压缩输出)。
+                为 None 时用 config["glm_max_tokens"]。
     请求结构：system(固定) + user[text(固定), image(变化)]
     前缀稳定以最大化API侧缓存命中
     """
@@ -65,6 +67,7 @@ def call_glm_vision(image_path, config, custom_prompt=None):
     # 构造请求：user[image, text]，无 system（glm-4.6v 要求 image 在前且无 system 才返回内容）
     # 若该结构返回空，降级重试另一种结构（兼容 glm-4v-flash 等需要 system+text 在前的模型）
     user_prompt = custom_prompt or config.get("user_prompt", "")
+    out_tokens = max_tokens if max_tokens is not None else config.get("glm_max_tokens", 4096)
 
     def build_payload(img_b64, mode):
         """mode=1: image在前无system (glm-4.6v); mode=2: system+text在前 (glm-4v-flash等)"""
@@ -78,7 +81,7 @@ def call_glm_vision(image_path, config, custom_prompt=None):
                     ]},
                 ],
                 "temperature": config.get("glm_temperature", 0.0),
-                "max_tokens": config.get("glm_max_tokens", 4096),
+                "max_tokens": out_tokens,
                 "thinking": {"type": "enabled" if config.get("glm_thinking", False) else "disabled"},
             }
         else:
@@ -92,7 +95,7 @@ def call_glm_vision(image_path, config, custom_prompt=None):
                     ]},
                 ],
                 "temperature": config.get("glm_temperature", 0.0),
-                "max_tokens": config.get("glm_max_tokens", 4096),
+                "max_tokens": out_tokens,
                 "thinking": {"type": "enabled" if config.get("glm_thinking", False) else "disabled"},
             }
 

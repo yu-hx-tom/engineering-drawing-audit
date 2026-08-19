@@ -116,6 +116,16 @@ engineering-drawing-audit/
 | Confirmed omission | 客户标注在重绘中无等价表达 |
 | Needs manual confirmation | 源图模糊或特征对应不完整 |
 
+## 推理配置说明
+
+本分支用于 **Claude Code + DeepSeek 推理配置下的工程图纸审核**:
+
+- **视觉识别**: 智谱 GLM(默认 `glm-4.6v`)负责识别图纸图片(尺寸/公差/符号/基准/形位公差/粗糙度), 输出结构化纯文本标注清单。
+- **推理/审核判断**: 由下游纯文本推理模型完成——正常配置使用 **DeepSeek**(`claude-code` 作为编排与推理入口), 依据 GLM 的视觉读数做差异比对、状态判定与报告撰写。
+- **`--terse` 精简定向模式(2026-08-19)**: 差异项定向核验/原图反向查证时, 用 `engineering-drawing-terse.txt` 精简提示词只答目标标注、并把输出 token 上限压到 800(完整模式 4096), 显著降低推理 token 消耗而不损失识别质量。
+
+> 提示词文件 `prompts/engineering-drawing.txt`(完整)/`engineering-drawing-terse.txt`(精简)与脚本 `scripts/glm_drawing.py` `batch_glm.py` 均支持 `--terse`。
+
 ## 许可证
 
 MIT License。详见 [LICENSE](LICENSE)。

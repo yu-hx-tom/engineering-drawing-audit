@@ -15,17 +15,23 @@ description: 审核客户工程图纸与 SolidWorks/CAD 重绘图的尺寸、公
 2. 检查页数、页面边框、旋转、可提取文本、扫描质量。
 3. **整体解析/文档文字层**用 Visuals-Skill 的 MinerU(对 PDF/Word/PPT/Excel 提取 Markdown 文字层, 用于标题栏/技术要求检索):
    ```bash
-   py 本仓库 scripts/ 的 MinerU/OCR 封装 --image "<文档.pdf>" --format json
+   py ~/.claude/skills/visuals-skill/scripts/image_to_text.py --image "<文档.pdf>" --format json
    ```
    **注意**: 图纸的**图片读取一律走下面的 `glm_drawing.py` 封装**, 不要用 `image_to_text.py` 对图纸图片做 GLM 读取——它的 GLM 分支会把输出强制归一化到 `[TYPE]/[SCENE]/[COLOR]` 等 10 个通用标签, 破坏图纸的"视图 | 标注 | 物理特征"格式输出(2026-08-12 确认)。
-   **工程图纸专用 GLM 读取(强制, 2026-08-11 优化, 2026-08-12 封装)**: 对图纸识别(尺寸/公差/符号/物理特征), 必须用本 skill 的封装 `glm_drawing.py`——它内部强制加载 `prompts/engineering-drawing.txt` 专用提示词, 提示词文件缺失时报错退出, **绝不回退到默认通用 10 维描述**:
+   **工程图纸专用 GLM 读取(强制, 2026-08-11 优化, 2026-08-12 封装)**: 对图纸识别(尺寸/公差/符号/物理特征), 必须用本 skill 的封装 `glm_drawing.py`——它内部强制加载 `visuals-skill/prompts/engineering-drawing.txt` 专用提示词, 提示词文件缺失时报错退出, **绝不回退到默认通用 10 维描述**:
    ```bash
-   py <SKILL_DIR>/scripts/glm_drawing.py "<渲染图.png>"
+   py ~/.claude/skills/engineering-drawing-audit/scripts/glm_drawing.py "<渲染图.png>"
    # 需要追加补充指令时(如原图反向查证找某个值):
-   py <SKILL_DIR>/scripts/glm_drawing.py "<渲染图.png>" --extra "找 1705.7 附近直径并确认其数值"
+   py ~/.claude/skills/engineering-drawing-audit/scripts/glm_drawing.py "<渲染图.png>" --extra "找 1705.7 附近直径并确认其数值"
    # 覆盖提示词文件 / 输出 JSON:
-   py <SKILL_DIR>/scripts/glm_drawing.py "<渲染图.png>" --prompt <文件> --json
+   py ~/.claude/skills/engineering-drawing-audit/scripts/glm_drawing.py "<渲染图.png>" --prompt <文件> --json
+   # 精简定向模式(2026-08-19 新增): 只答目标标注, 不遍历全图, 输出 token 从 4096 压到 800。
+   # 用于差异项定向核验 / 原图反向查证("某值在不在/精确位数/公差形式"), 可显著省 token:
+   py ~/.claude/skills/engineering-drawing-audit/scripts/glm_drawing.py "<裁剪图.png>" --terse --extra "目标标注: 凸台内圈直径 Ø? 是 Ø332 还是 Ø333? 是否 REF/括号参考"
    ```
+   完整模式(不带 `--terse`)走 `engineering-drawing.txt` 全量提示词, 用于视图标定/整体自由读(需要完整性);
+   精简模式(`--terse`)走 `engineering-drawing-terse.txt`, 保留防臆造/防漏读/基准防伪/参考属性护栏, 但只让 GLM 答目标问题、不补全各类别、不输出"无XX"模板行。
+   `batch_glm.py` 同样支持 `--terse`(批量定向核验时并行且省 token)。
    该提示词要求: 按视图分组、物理特征具体名称(依据尺寸界线/引出线)、捕获Ø/R/±/度分秒/参考尺寸(REF/*/括号)/基准符号/形位公差框/Ra粗糙度/数量。**这是从答案级报告提炼的关键改进**——通用提示词会漏基准、形位公差、参考弧长, 且物理特征描述泛泛。
 4. **高清渲染与局部放大**用本 skill 自带脚本(本地 PyMuPDF,无 API 费用):
    ```bash
@@ -108,7 +114,7 @@ description: 审核客户工程图纸与 SolidWorks/CAD 重绘图的尺寸、公
   = 重绘图 尺寸-物理特征-视图 综合信息
 ```
 
-- 脚本位置: `仓库 scripts/ 目录下 extract_dimension_ledger.py`、`detect_drawing_views.py`。依赖 pymupdf/numpy/pillow(本机已装); `extract_dimension_ledger.py --self-test` 可自检。
+- 脚本位置: `D:\claude-code-space\python脚本\extract_dimension_ledger.py`、`detect_drawing_views.py`。依赖 pymupdf/numpy/pillow(本机已装); `extract_dimension_ledger.py --self-test` 可自检。
 - `extract_dimension_ledger.py`: 提取尺寸文字/公差/英制分数/类型, 追踪尺寸线-延长线-箭头-引线(几何归属, 优于纯坐标聚合), 排除标题栏/技术要求, 歧义项标 `needs_review`。要求 PDF 有文字层; 纯扫描 PDF 会被拒绝。
 - `detect_drawing_views.py`: 按尺寸箭头/引线端点 + 线稿划分视图, 补无尺寸视图, 排除 3D 模型, 输出每视图透明 PNG + `view-regions.json` + `view-review.pdf`。**视图边界由脚本客观给出, 取代 GLM 归因与手工坐标定位。**
 - 该综合信息用途: ① 作为重绘侧权威(类似 dim-table, 但含物理特征与视图归属); ② **指导原图识别**——用重绘的"值+特征+视图"去原图对应物理特征处核销。
@@ -154,9 +160,16 @@ build_dim_table 只覆盖**重绘侧**。**客户原图若也有文字层(矢量
   ```bash
   py "${CLAUDE_SKILL_DIR}/scripts/batch_glm.py" <图1> <图2> ... --workers 4
   py "${CLAUDE_SKILL_DIR}/scripts/batch_glm.py" <裁剪目录> --glob "*.png" --workers 4
+  # 批量定向核验(多个差异候选): 加 --terse 只答目标标注并压 token
+  py "${CLAUDE_SKILL_DIR}/scripts/batch_glm.py" 裁剪1 裁剪2 ... --workers 4 --terse --extra "精确读各图目标标注数值"
   ```
 
 **15 分钟目标(单案例)**: 目标作用于**识别+核销**环节; 报告撰写不压缩, 保持完整答案级。
+
+**GLM 调用模式选择(2026-08-19, 控制 token)**: 
+- **完整模式**(默认): 视图标定/整体自由读用。需要完整性, 输出较长(最高 4096 token), 读后**用脚本只抽"值|特征|位置"三列进上下文**, 不整段读。
+- **精简模式**(`--terse`, 输出 800 token 内): 差异项定向核验/原图反向查证("某值在不在/精确位数/公差形式")用。只答目标标注, 显著省 token; 主值一致仅公差/位数待核、或"是否确认存在"这类单点问题一律走 terse。
+- batch_glm 加 `--terse` 可在批量定向核验时并行且压缩输出。
 | 环节 | 分配 | 手段 |
 |---|---|---|
 | 读规范/台账 | 0-1 分 | skill 要点 + 台账摘要预加载进子代理 prompt, 不自己读 |
@@ -214,6 +227,24 @@ build_dim_table 只覆盖**重绘侧**。**客户原图若也有文字层(矢量
 - **客户读数与重绘一致时仍要确认客户值本身可读**: 客户扫描清晰可读且=重绘 → Match; 客户扫描模糊(即使"像重绘")→ 标 Needs manual 或并入并行批二次读, 不默认一致。
 - **独立怀疑默认**: 客户值≈重绘值的情形, 默认假设"客户可能不同", 用临界值二次确认(见配套规则3)交叉验证, 而不是默认一致。
 - 三层核销天然防锚定: ①整体自由读在不知重绘值时完成; ②台账比对是机器代码(0 GLM)不产生锚定; ③差异定向核验先读客户值再比对。
+
+### 上下文精简与输入预算(round7 固化, 2026-08-14)
+
+**原则: 每图有效输入控制 <100 行。台账/GLM 输出一律写文件, 只把"精简列"进上下文; 差异候选驱动核验, Match 项不读。**
+
+1. **台账只提取精简列**: 对 `dimension-ledger.json`, 用脚本只打印 `ID | 值(normalized_text) | 类型(type) | 参考(reference)` 四列(46 条≈46 行), 不打印每条的 25 个全字段(数千行)。需看某条细节(公差/坐标/数量)时再单独 grep 该条。
+   - 反例: 直接 print 整个 JSON → 上千行进上下文。实测 780630 曾全量打印 46 条台账索引字段, 白白耗掉上下文。
+2. **GLM desc 写文件只提取要点**: batch_glm `--out-dir` 保存完整 desc; 进上下文前用脚本提取"值|特征|位置"三列表(或 head -N 截断), 绝不整段读。判断完即弃, 不重复 head 同文件。
+3. **差异候选驱动**: 台账双向比对后只列出差异候选(原图独有/重绘独有/名义值不同/文本不同), 通常 10-20 条; Match 项只计数不读内容。核验/裁剪只针对差异候选, 不逐项确认 Match。
+4. **batch_glm out-dir 按侧隔离**: 原图与重绘视图 PNG 可能同名(都叫 P1-V01.png), 必须用不同 out-dir(如 desc-redraw / desc-client), 否则 desc 互相覆盖(780630 实测踩坑)。
+5. **前置查文字层字符数**: 审核开始先 `fitz` 查两份 PDF 文本层字符数; 字符>0 的侧走两个脚本, =0 的侧走 GLM 扫图。避免对扫描件盲跑 extract_dimension_ledger(会被拒)或对矢量图盲扫。
+6. **单图审核模板**: 用户只给单张 PDF(无对比对象)时, 按"图纸完整性审核"(视图/尺寸/技术要求/疑点清单)输出, 不强找对比对象; 需要对比时由用户指定。
+7. **报告一次写回**: 重绘骨架先写、原图核销后补(两段式), 合并一次 Write 写出, 不逐轮读回中间产物。
+
+**不降质护栏(精简不得牺牲结论完整性)**:
+1. **精简列必须保留"符号/参考"**: 值列保留完整标注文本(含公差 ±/+/-、REF/括号/星号、粗糙度), 不得截成纯数字(如 `115.7 -3 5/+` 不能截成 `115.7`; `(445)` 不能丢括号; `Ø2|B` 不能丢 Ø 和基准)。符号/参考是判定 Difference/error 的关键, 丢了会漏判或误判。
+2. **"只读差异"≠"报告只写差异"**: 核销阶段 Match 项可只计数不读内容, 但**报告必须逐条列出全部客户标注**(answer-grade 要求每尺寸一行 + ID 核销), 否则 ID 完整性破坏、等于降质缩水。
+3. **提取优先于截断**: 要点用"脚本提取关键列", 不用粗暴 head -N(公差/参考常落在文本后部, 一截就丢); 宁可多读 2-3 行, 不丢字段。head 只用于"确认图内容非空", 不用于取结论。
 
 ## 平衡护栏与推断
 
