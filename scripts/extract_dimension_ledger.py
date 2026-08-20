@@ -358,6 +358,70 @@ def detect_vector_concentricity_symbol(
     }
 
 
+def detect_vector_total_runout_symbol(
+    drawing: dict[str, Any], page_number: int, path_index: int
+) -> dict[str, Any] | None:
+    """Recognize the double-arrow glyph used for total runout."""
+    rect = drawing.get("rect")
+    line_items = [item for item in drawing.get("items", []) if item[0] == "l"]
+    if rect is None or len(line_items) != 7:
+        return None
+    width, height = float(rect.width), float(rect.height)
+    if not 4.0 <= min(width, height) or max(width, height) > 24.0:
+        return None
+
+    nodes: list[tuple[float, float]] = []
+    edges: list[tuple[int, int]] = []
+
+    def node_index(value: tuple[float, float]) -> int:
+        for index, existing in enumerate(nodes):
+            if distance(value, existing) <= 0.45:
+                return index
+        nodes.append(value)
+        return len(nodes) - 1
+
+    for item in line_items:
+        first, second = node_index(point(item[1])), node_index(point(item[2]))
+        if first == second:
+            return None
+        edges.append((first, second))
+    if len(nodes) != 8:
+        return None
+
+    neighbors = {index: set() for index in range(len(nodes))}
+    for first, second in edges:
+        neighbors[first].add(second)
+        neighbors[second].add(first)
+    degrees = sorted(len(values) for values in neighbors.values())
+    if degrees != [1, 1, 1, 1, 2, 2, 3, 3]:
+        return None
+    tips = [index for index, values in neighbors.items() if len(values) == 3]
+    bases = [index for index, values in neighbors.items() if len(values) == 2]
+    if not all(
+        sum(len(neighbors[value]) == 1 for value in neighbors[tip]) == 2
+        and sum(value in bases for value in neighbors[tip]) == 1
+        for tip in tips
+    ):
+        return None
+    if bases[1] not in neighbors[bases[0]]:
+        return None
+
+    glyph_box = [
+        min(value[0] for value in nodes), min(value[1] for value in nodes),
+        max(value[0] for value in nodes), max(value[1] for value in nodes),
+    ]
+    center = bbox_center(glyph_box)
+    return {
+        "id": f"P{page_number}-SYM{path_index:04d}",
+        "path_id": f"P{page_number}-V{path_index:04d}",
+        "kind": "total_runout",
+        "text": "\u2330",
+        "bbox": [rounded(value) for value in glyph_box],
+        "center": [rounded(center[0]), rounded(center[1])],
+        "rotation_deg": 0.0,
+    }
+
+
 def detect_vector_diameter_symbol(
     drawing: dict[str, Any], page_number: int, path_index: int
 ) -> dict[str, Any] | None:
@@ -428,6 +492,8 @@ def extract_vector_geometry(page: Any, page_number: int) -> PageGeometry:
         path_id = f"P{page_number}-V{path_index:04d}"
         path_drawings[path_id] = drawing
         symbol = detect_vector_concentricity_symbol(drawing, page_number, path_index)
+        if symbol is None:
+            symbol = detect_vector_total_runout_symbol(drawing, page_number, path_index)
         if symbol is None:
             symbol = detect_vector_diameter_symbol(drawing, page_number, path_index)
         if symbol is not None:
@@ -528,11 +594,10 @@ def detect_geometric_tolerance_frames(
 ) -> tuple[list[dict[str, Any]], set[str]]:
     """Assemble strict vector feature-control frames into structured records.
 
-    This first implementation intentionally supports the evidence combination
-    seen in ZM-786: a coaxiality characteristic, diameter tolerance zone,
-    numeric tolerance, and datum reference.  Requiring the complete closed
-    frame plus all four semantic components prevents ordinary tables and bare
-    numbers from being consumed.
+    Supported characteristics are deliberately limited to vector glyphs with
+    strict detectors. Requiring the complete closed frame, characteristic,
+    numeric tolerance, and datum prevents ordinary tables and bare numbers
+    from being consumed.
     """
     horizontal = [
         segment for segment in geometry.segments
@@ -600,7 +665,11 @@ def detect_geometric_tolerance_frames(
             and frame[1] - 0.5 <= symbol["center"][1] <= frame[3] + 0.5
         ]
         characteristic = next(
-            (symbol for symbol in inside_symbols if symbol["kind"] == "coaxiality"), None
+            (
+                symbol for symbol in inside_symbols
+                if symbol["kind"] in {"coaxiality", "total_runout"}
+            ),
+            None,
         )
         diameter = next(
             (symbol for symbol in inside_symbols if symbol["kind"] == "diameter"), None
@@ -613,24 +682,38 @@ def detect_geometric_tolerance_frames(
             token for token in inside_tokens
             if re.fullmatch(NUMBER_RE, token["normalized_text"])
         ]
-        if not characteristic or not diameter or len(datum_tokens) != 1 or len(numeric_tokens) != 1:
+        if (
+            not characteristic
+            or (characteristic["kind"] == "coaxiality" and not diameter)
+            or len(datum_tokens) != 1
+            or len(numeric_tokens) != 1
+        ):
             continue
         tolerance_token = numeric_tokens[0]
         tolerance_value = parse_number(tolerance_token["normalized_text"])
         if tolerance_value is None or tolerance_value < 0:
             continue
         datum = datum_tokens[0]["normalized_text"]
+        characteristic_kind = characteristic["kind"]
+        characteristic_symbol = characteristic["text"]
+        tolerance_prefix = diameter["text"] if diameter else ""
+        tolerance_text = f"{tolerance_prefix}{tolerance_token['normalized_text']}"
+        controlled_feature = (
+            "leader_indicated_surface_axis"
+            if characteristic_kind == "coaxiality"
+            else "leader_indicated_surface"
+        )
         frame_segment_ids = {segment["id"] for segment in frame_segments}
         leader_ids, arrow_ids = _frame_leader_evidence(frame, frame_segment_ids, geometry)
         all_line_ids = sorted(frame_segment_ids | set(leader_ids))
-        raw_text = f"\u25ce | {datum} | \u2300{tolerance_token['normalized_text']}"
+        raw_text = f"{characteristic_symbol} | {tolerance_text} | {datum}"
         records.append(
             {
                 "id": "",
                 "page": tolerance_token["page"],
                 "raw_text": raw_text,
                 "normalized_text": raw_text,
-                "canonical_text": f"\u25ce | \u2300{tolerance_token['normalized_text']} | {datum}",
+                "canonical_text": raw_text,
                 "type": "geometric_tolerance",
                 "nominal_text": None,
                 "nominal": None,
@@ -648,13 +731,13 @@ def detect_geometric_tolerance_frames(
                 "angle_seconds": None,
                 "distribution_angle_deg": None,
                 "surface_roughness_parameter": None,
-                "geometric_characteristic": "coaxiality",
-                "characteristic_symbol": "\u25ce",
+                "geometric_characteristic": characteristic_kind,
+                "characteristic_symbol": characteristic_symbol,
                 "geometric_tolerance": rounded(tolerance_value, 6),
                 "geometric_tolerance_unit": default_unit,
-                "tolerance_zone": "diameter",
+                "tolerance_zone": "diameter" if diameter else "surface",
                 "datum_references": [datum],
-                "controlled_feature": "leader_indicated_surface_axis",
+                "controlled_feature": controlled_feature,
                 "parse_notes": [],
                 "rotation_deg": 0.0,
                 "direction": [1.0, 0.0],
@@ -662,7 +745,10 @@ def detect_geometric_tolerance_frames(
                 "font_size": max(token["size"] for token in inside_tokens),
                 "root_token_id": tolerance_token["id"],
                 "fragment_token_ids": [datum_tokens[0]["id"]],
-                "vector_symbol_ids": [characteristic["id"], diameter["id"]],
+                "vector_symbol_ids": [
+                    characteristic["id"],
+                    *([diameter["id"]] if diameter else []),
+                ],
                 "fragments": [
                     {
                         "id": datum_tokens[0]["id"], "text": datum_tokens[0]["text"],
@@ -682,8 +768,13 @@ def detect_geometric_tolerance_frames(
                     "extension_segment_ids": [],
                     "frame_bbox": [rounded(value) for value in frame],
                     "leader_connected": bool(leader_ids),
-                    "controlled_feature_kind": "surface_axis",
-                    "confidence_basis": "closed_frame+coaxiality+diameter+tolerance+datum",
+                    "controlled_feature_kind": (
+                        "surface_axis" if diameter else "surface"
+                    ),
+                    "confidence_basis": (
+                        f"closed_frame+{characteristic_kind}"
+                        f"+{'diameter+' if diameter else ''}tolerance+datum"
+                    ),
                 },
                 "status": "accepted",
                 "review_reason": None,
@@ -1440,6 +1531,81 @@ def detect_imperial_fraction_clusters(
     return clusters, consumed
 
 
+def complete_angle_value(token: dict[str, Any]) -> dict[str, Any] | None:
+    """Parse one complete DMS angle token without accepting tolerance fragments."""
+    match = re.fullmatch(
+        rf"\s*({NUMBER_RE})\s*°(?:\s*({NUMBER_RE})\s*')?(?:\s*({NUMBER_RE})\s*\")?\s*",
+        token["normalized_text"],
+    )
+    if not match:
+        return None
+    degrees = parse_number(match.group(1))
+    minutes = parse_number(match.group(2)) if match.group(2) else 0.0
+    seconds = parse_number(match.group(3)) if match.group(3) else 0.0
+    if degrees is None or minutes is None or seconds is None:
+        return None
+    if not 0.0 <= minutes < 60.0 or not 0.0 <= seconds < 60.0:
+        return None
+    return {
+        "token": token,
+        "value": degrees + minutes / 60.0 + seconds / 3600.0,
+        "degrees": degrees,
+        "minutes": minutes,
+        "seconds": seconds,
+    }
+
+
+def detect_stacked_angular_limit_clusters(
+    page_tokens: Sequence[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    """Pair peer-size stacked complete angles into one upper/lower limit record."""
+    angles = [value for token in page_tokens if (value := complete_angle_value(token))]
+    options: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+    for index, left in enumerate(angles):
+        left_token = left["token"]
+        for right in angles[index + 1:]:
+            right_token = right["token"]
+            if (
+                left_token["block"] != right_token["block"]
+                or abs(left_token["line"] - right_token["line"]) != 1
+                or not compatible_rotation(left_token, right_token)
+                or left_token.get("font") != right_token.get("font")
+            ):
+                continue
+            size = max((left_token["size"] + right_token["size"]) / 2.0, 4.0)
+            if abs(left_token["size"] - right_token["size"]) > size * 0.08:
+                continue
+            delta = abs(left["value"] - right["value"])
+            if not 1e-8 < delta <= 1.0:
+                continue
+            if int(left["degrees"]) != int(right["degrees"]):
+                continue
+            u = tuple(left_token["direction"])
+            v = (-u[1], u[0])
+            center_delta = vec_sub(
+                bbox_center(right_token["bbox"]), bbox_center(left_token["bbox"])
+            )
+            along = abs(dot(center_delta, u))
+            perpendicular = abs(dot(center_delta, v))
+            if along > size * 0.55 or not size * 0.55 <= perpendicular <= size * 1.45:
+                continue
+            options.append((along + abs(perpendicular - size), left, right))
+
+    clusters: dict[str, dict[str, Any]] = {}
+    consumed: set[str] = set()
+    for _, left, right in sorted(
+        options, key=lambda item: (item[0], item[1]["token"]["id"], item[2]["token"]["id"])
+    ):
+        token_ids = {left["token"]["id"], right["token"]["id"]}
+        if token_ids & consumed:
+            continue
+        lower, upper = sorted((left, right), key=lambda value: value["value"])
+        root_id = lower["token"]["id"]
+        clusters[root_id] = {"lower": lower, "upper": upper}
+        consumed.update(token_ids)
+    return clusters, consumed
+
+
 def infer_fraction_text(root: dict[str, Any], fragments: Sequence[dict[str, Any]]) -> str | None:
     u = tuple(root["direction"])
     v = (-u[1], u[0])
@@ -1807,6 +1973,41 @@ def parse_annotation(
         "surface_roughness_parameter": roughness_parameter,
         "parse_notes": notes,
     }
+
+
+def parse_stacked_angular_limits(
+    cluster: dict[str, Any], default_unit: str | None
+) -> dict[str, Any]:
+    """Represent two complete stacked angle values as one limit dimension."""
+    lower = cluster["lower"]
+    upper = cluster["upper"]
+    parsed = parse_annotation(lower["token"], [], default_unit)
+    lower_text = lower["token"]["normalized_text"]
+    upper_text = upper["token"]["normalized_text"]
+    if '"' in upper_text or '"' in lower_text:
+        tolerance_unit, scale = "arcsec", 3600.0
+    elif "'" in upper_text or "'" in lower_text:
+        tolerance_unit, scale = "arcmin", 60.0
+    else:
+        tolerance_unit, scale = "deg", 1.0
+    upper_deviation = (upper["value"] - lower["value"]) * scale
+    parsed.update(
+        {
+            "raw_text": f"{upper_text} / {lower_text}",
+            "normalized_text": f"{upper_text} / {lower_text}",
+            "nominal_text": lower_text,
+            "nominal": rounded(lower["value"], 6),
+            "tolerance_upper": rounded(upper_deviation, 6),
+            "tolerance_lower": 0.0,
+            "tolerance_unit": tolerance_unit,
+            "limit_upper_text": upper_text,
+            "limit_lower_text": lower_text,
+            "limit_upper": rounded(upper["value"], 6),
+            "limit_lower": rounded(lower["value"], 6),
+            "parse_notes": [],
+        }
+    )
+    return parsed
 
 
 def segment_line_distance(segment: dict[str, Any], p: Sequence[float]) -> float:
@@ -2749,9 +2950,13 @@ def analyze_pdf(input_path: Path, default_unit: str | None = None) -> dict[str, 
             imperial_clusters, imperial_consumed = detect_imperial_fraction_clusters(
                 tokens, geometry.symbols
             )
+            angular_limit_clusters, angular_limit_consumed = (
+                detect_stacked_angular_limit_clusters(tokens)
+            )
             generic_tokens = [
                 token for token in tokens
                 if token["id"] not in imperial_consumed
+                and token["id"] not in angular_limit_consumed
                 and token["id"] not in geometric_tolerance_consumed
             ]
             internal_geometries[page_index] = geometry
@@ -2769,6 +2974,7 @@ def analyze_pdf(input_path: Path, default_unit: str | None = None) -> dict[str, 
                     ),
                     "vector_symbol_count": len(geometry.symbols),
                     "geometric_tolerance_frame_count": len(geometric_tolerances),
+                    "stacked_angular_limit_count": len(angular_limit_clusters),
                     "detected_title_block": title_block_rect,
                     "detected_technical_note_blocks": technical_note_rects,
                 }
@@ -2781,7 +2987,12 @@ def analyze_pdf(input_path: Path, default_unit: str | None = None) -> dict[str, 
                     continue
                 if root["id"] in imperial_consumed and root["id"] not in imperial_clusters:
                     continue
+                if root["id"] in angular_limit_consumed and root["id"] not in angular_limit_clusters:
+                    continue
+                angular_cluster = angular_limit_clusters.get(root["id"])
                 fragments = imperial_clusters.get(root["id"])
+                if angular_cluster:
+                    fragments = [{"token": angular_cluster["upper"]["token"], "role": "upper_limit"}]
                 if fragments is None:
                     fragments = collect_fragments(root, generic_tokens, geometry.symbols)
                 active_roots.append(root)
@@ -2790,7 +3001,11 @@ def analyze_pdf(input_path: Path, default_unit: str | None = None) -> dict[str, 
 
             for root in active_roots:
                 fragments = fragments_by_root[root["id"]]
-                parsed = parse_annotation(root, fragments, default_unit)
+                angular_cluster = angular_limit_clusters.get(root["id"])
+                parsed = (
+                    parse_stacked_angular_limits(angular_cluster, default_unit)
+                    if angular_cluster else parse_annotation(root, fragments, default_unit)
+                )
                 annotation = {
                     "id": "",
                     "page": page_index,
@@ -2819,6 +3034,8 @@ def analyze_pdf(input_path: Path, default_unit: str | None = None) -> dict[str, 
                 }
                 if root["id"] in imperial_clusters:
                     annotation["assembly_basis"] = "quote_anchored_imperial_fraction"
+                elif angular_cluster:
+                    annotation["assembly_basis"] = "stacked_angular_limits"
                 roughness = surface_roughness_evidence(annotation, geometry)
                 if roughness:
                     annotation["type"] = "surface_roughness"
@@ -2890,6 +3107,7 @@ def analyze_pdf(input_path: Path, default_unit: str | None = None) -> dict[str, 
 CSV_FIELDS = (
     "id", "page", "status", "review_reason", "raw_text", "type", "nominal_text",
     "nominal", "unit", "tolerance_upper", "tolerance_lower", "tolerance_unit",
+    "limit_upper_text", "limit_lower_text", "limit_upper", "limit_lower",
     "quantity", "reference", "fit", "thread_pitch", "angle_degrees", "angle_minutes",
     "angle_seconds", "distribution_angle_deg", "rotation_deg", "bbox", "geometry_relationship",
     "geometry_score", "geometry_unique", "root_token_id", "fragment_token_ids",

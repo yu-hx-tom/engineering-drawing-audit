@@ -360,6 +360,79 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(record["geometry"]["relationship"], "feature_control_frame")
         self.assertEqual(record["geometry"]["arrow_ids"], ["ARROW"])
 
+    def test_vector_total_runout_symbol_is_not_split_into_arrows(self):
+        point = fitz.Point
+        drawing = {
+            "rect": fitz.Rect(100, 100, 111, 112),
+            "items": [
+                ("l", point(104, 100), point(101.7, 103.1)),
+                ("l", point(104, 100), point(103.6, 103.9)),
+                ("l", point(100, 111.1), point(104, 100)),
+                ("l", point(100, 111.1), point(106.3, 111.1)),
+                ("l", point(110.4, 100), point(108, 103.1)),
+                ("l", point(110.4, 100), point(110, 103.9)),
+                ("l", point(106.3, 111.1), point(110.4, 100)),
+            ],
+        }
+        symbol = ledger.detect_vector_total_runout_symbol(drawing, 1, 16)
+        self.assertIsNotNone(symbol)
+        self.assertEqual(symbol["kind"], "total_runout")
+        self.assertEqual(symbol["text"], "\u2330")
+
+    def test_closed_total_runout_frame_is_one_structured_record(self):
+        def segment(identifier, p1, p2):
+            angle = ledger.normalize_180(
+                math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
+            )
+            return {
+                "id": identifier, "path_id": "V1", "p1": list(p1), "p2": list(p2),
+                "length": ledger.distance(p1, p2), "angle_deg": angle,
+                "width": 0.5, "color": (1.0, 0.0, 1.0), "fill": None,
+                "dashes": "[] 0",
+            }
+
+        segments = [
+            segment("TOP", (100, 100), (160, 100)),
+            segment("BOTTOM", (100, 120), (160, 120)),
+            segment("LEFT", (100, 100), (100, 120)),
+            segment("SEP1", (120, 100), (120, 120)),
+            segment("SEP2", (140, 100), (140, 120)),
+            segment("RIGHT", (160, 100), (160, 120)),
+            segment("LAND", (160, 110), (175, 110)),
+            segment("LEADER", (175, 110), (195, 130)),
+        ]
+        symbols = [{
+            "id": "RUNOUT", "kind": "total_runout", "text": "\u2330",
+            "bbox": [103, 103, 117, 117], "center": [110, 110],
+            "rotation_deg": 0,
+        }]
+        arrows = [{
+            "id": "ARROW", "kind": "open", "tip": [195, 130],
+            "direction": [0.7, 0.7], "bbox": [188, 123, 195, 130],
+            "segment_ids": [],
+        }]
+        tolerance = token("2", bbox=(125, 103, 134, 117))
+        tolerance["id"] = "TOLERANCE"
+        datum = token("A", bbox=(145, 103, 154, 117))
+        datum["id"] = "DATUM"
+        geometry = ledger.PageGeometry(
+            segments, arrows, ledger.build_segment_adjacency(segments), symbols
+        )
+
+        records, consumed = ledger.detect_geometric_tolerance_frames(
+            [tolerance, datum], geometry, "mm"
+        )
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(consumed, {"TOLERANCE", "DATUM"})
+        self.assertEqual(record["geometric_characteristic"], "total_runout")
+        self.assertEqual(record["geometric_tolerance"], 2.0)
+        self.assertEqual(record["tolerance_zone"], "surface")
+        self.assertEqual(record["datum_references"], ["A"])
+        self.assertEqual(record["vector_symbol_ids"], ["RUNOUT"])
+        self.assertEqual(record["canonical_text"], "\u2330 | 2 | A")
+
     def test_status_accepts_explainable_arrow_evidence_but_not_bare_nearby_line(self):
         base = {
             "normalized_text": "25", "context_line_text": "25", "nominal": 25.0,
@@ -686,6 +759,34 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(parsed["tolerance_lower"], 0.0)
         self.assertEqual(parsed["tolerance_unit"], "deg")
         self.assertEqual(parsed["parse_notes"], [])
+
+    def test_peer_size_stacked_complete_angles_become_one_limit_dimension(self):
+        upper = token("50°10'", size=14.19, bbox=(581.036, 509.077, 612.903, 560.518), rotation=291.89)
+        lower = token("50°", size=14.19, bbox=(571.84, 524.235, 595.775, 555.93), rotation=291.89)
+        upper["id"], lower["id"] = "UPPER", "LOWER"
+        upper["block"] = lower["block"] = 21
+        upper["line"], lower["line"] = 0, 1
+        clusters, consumed = ledger.detect_stacked_angular_limit_clusters([upper, lower])
+        self.assertEqual(set(clusters), {"LOWER"})
+        self.assertEqual(consumed, {"UPPER", "LOWER"})
+        parsed = ledger.parse_stacked_angular_limits(clusters["LOWER"], "mm")
+        self.assertEqual(parsed["raw_text"], "50°10' / 50°")
+        self.assertEqual(parsed["nominal"], 50.0)
+        self.assertEqual(parsed["tolerance_upper"], 10.0)
+        self.assertEqual(parsed["tolerance_lower"], 0.0)
+        self.assertEqual(parsed["tolerance_unit"], "arcmin")
+        self.assertEqual(parsed["limit_upper"], 50.166667)
+        self.assertEqual(parsed["limit_lower"], 50.0)
+
+    def test_adjacent_complete_angles_in_different_blocks_stay_separate(self):
+        first = token("50°10'", size=14.19, bbox=(581.036, 509.077, 612.903, 560.518), rotation=291.89)
+        second = token("50°", size=14.19, bbox=(571.84, 524.235, 595.775, 555.93), rotation=291.89)
+        first["id"], second["id"] = "FIRST", "SECOND"
+        first["block"], second["block"] = 21, 22
+        first["line"], second["line"] = 0, 1
+        clusters, consumed = ledger.detect_stacked_angular_limit_clusters([first, second])
+        self.assertEqual(clusters, {})
+        self.assertEqual(consumed, set())
 
     def test_angular_deviation_unit_comes_from_tolerance_fragment(self):
         root = token("30°", size=12.7, bbox=(472.2, 355.1, 506.2, 375.1), rotation=350.78)
