@@ -151,19 +151,38 @@ py <SKILL_DIR>/scripts/enhance_image.py "<裁剪图.png>" --method clahe --gray 
 - **统一云端维护**：所有核心脚本迭代由用户通过 GitHub 官方仓库统一维护：`https://github.com/yu-hx-tom/engineering-drawing-audit.git`；
 - **同步机制**：当用户提示脚本在 GitHub 有更新时，Agent 通过 `git pull` 或拉取远端文件覆盖同步并执行单元测试。
 
-### 3.5 思路一核心防护：视觉主审 + 脚本安检门阻断机制 (Pre-Report Security Gate)
-针对审图中**“同名数值污染视觉记忆”**（如客户图有多个 30、15、25，因重绘图有同名数字导致视觉误以为匹配）的致命缺陷，必须严格执行思路一两道防线：
+### 3.5 思路一核心防护：视觉主审 + 显式销项求差 + 脚本安检门阻断机制 (Pre-Report Targeted Security Gate)
+针对审图中**“同名数值污染视觉记忆”**（如客户图有多个 30、15、25，因重绘图有同名数字导致视觉误以为匹配）的致命缺陷，必须严格执行“**阶段 3 显式销项打勾 $\rightarrow$ 阶段 4 靶向求差扣减 $\rightarrow$ 残差切片二次定向核验**”闭环流水线：
 
-1. **第一道防线：同名尺寸实体引线强行解耦**：
-   - 凡是图纸上出现重复出现的同名数值（如 30、15、25、45° 等），视觉核销时**严禁仅凭数值配对**！必须强制显式写明其物理特征（如 `30 [止口槽深]` vs `30 [SECTION A-A 焊接吊耳高]`）；重绘图每个尺寸只能核销 1 处物理实体，绝不允许一抵二。
-2. **第二道防线：下笔写报告前强制运行安检门 (`audit_gate_check.py`)**：
-   ```bash
-   py <SKILL_DIR>/scripts/audit_gate_check.py "图纸审核/<项目名>/ledger_customer/dimension-ledger.json" "图纸审核/<项目名>/ledger_redraw/dimension-ledger.json" -o "图纸审核/<项目名>"
-   ```
-   - **拦截逻辑**：
-     - 若同名数值频次不一致（如客户图出现 3 次，重绘图仅出现 2 次），直接亮红灯报警！
-     - 若客户图存在未被对消的残差项（如漏注 15°、30、1097.4），安检门**强行阻断报告输出**！
-   - **拦截动作**：Agent 必须停下来，调取对应坐标的切图进行针对性“二次视觉复审”，确认为重绘图真正漏注后，必须在报告头部作为 `Confirmed omission` 加粗警告，严禁写出虚假的“零漏绘、零装配冲突”结论！
+1. **第一道防线：阶段 3 视觉主审与显式销项打勾 (`visual_matched_pairs.json`)**：
+   - Agent 进行全局视觉看图审图，对每一对尺寸进行物理实体引线确认。
+   - 凡是确认匹配（Match）、等价表达（Equivalent）或数值微差（Difference）的尺寸对，**显式沉淀为销项对底单** `visual_matched_pairs.json`：
+     ```json
+     {
+       "matched_pairs": [
+         { "customer_id": "P1-D0013", "redraw_id": "P1-D0012", "feature": "顶部最大外凸缘直径 Ø1552", "status": "Match" }
+       ]
+     }
+     ```
+   - **基数守恒与同名尺寸实体解耦**：同名尺寸严禁仅凭数值配对，重绘图每个尺寸只能核销 1 处物理实体，绝不允许一抵二。
+
+2. **第二道防线：阶段 4 集合精准求差与靶向残差切图 (`audit_gate_check.py`)**：
+   - 在下笔写报告前，强制运行升级版安检门求差器：
+     ```bash
+     py <SKILL_DIR>/scripts/audit_gate_check.py "图纸审核/<项目名>/ledger_customer/dimension-ledger.json" "图纸审核/<项目名>/ledger_redraw/dimension-ledger.json" --matched-pairs "图纸审核/<项目名>/visual_matched_pairs.json" --customer-pdf "图纸审核/<项目名>/customer_drawing.pdf" --redraw-pdf "图纸审核/<项目名>/redraw_drawing.pdf" -o "图纸审核/<项目名>"
+     ```
+   - **集合差运算机制**：
+     - 系统自动计算：
+       - **客户未核销残差**：$C_{\text{residuals}} = C_{\text{all}} \setminus C_{\text{matched}}$（如 $91 - 87 = \mathbf{4}$ 项）；
+       - **重绘未核销残差**：$R_{\text{residuals}} = R_{\text{all}} \setminus R_{\text{matched}}$（如 $85 - 82 = \mathbf{3}$ 项）；
+     - **自动生成 600 DPI 靶向切图**：自动截取这（3, 4）个残差项所在区域的局部高清切图并存入 `crops/residuals/`；
+     - **状态阻断**：只要存在未核销残差或同名碰撞频次差额，状态强制为 `INTERCEPTED`，严禁直接生成通过报告！
+
+3. **第三道防线：阶段 4 残差靶向二次定向核验**：
+   - Agent 不再需要在大图上漫游，**直接靶向调阅这具体的（3, 4）个残差切片与坐标**：
+     - 对客户残差逐项核验：确认为重绘图真正漏注的，定性为 `Confirmed omission` 并写入报告头部 `[!CAUTION]`；
+     - 对重绘残差逐项核验：确认为重绘独有工艺尺寸或等价表达的，写入报告对应专节；
+   - 彻底解决大模型瞬时视觉记忆漂移与同名掩盖问题，实现 100% 工业级确证闭环！
 
 ---
 
