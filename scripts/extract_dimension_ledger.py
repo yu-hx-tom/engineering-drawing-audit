@@ -47,6 +47,7 @@ SYMBOL_ONLY_RE = re.compile(
     re.IGNORECASE,
 )
 UNIT_RE = re.compile(r"^(?:mm|cm|m|in|inch|inches|\"|″)$", re.IGNORECASE)
+REF_RE = re.compile(r"(?<![A-Za-z_])REF\.?(?![A-Za-z0-9_])", re.IGNORECASE)
 FIT_RE = re.compile(r"^(?:[A-Za-z]{1,2}\d{1,2}|[A-Za-z]\d/[A-Za-z]\d)$")
 ROUGHNESS_TEXT_RE = re.compile(
     rf"^(?P<parameter>Ra|Rz|Rt|Rq|Rmax)\s*(?P<value>{NUMBER_RE})$",
@@ -537,6 +538,88 @@ def extract_vector_geometry(page: Any, page_number: int) -> PageGeometry:
     return PageGeometry(segments=segments, arrows=arrows, adjacency=adjacency, symbols=symbols)
 
 
+def vector_open_chains(segments: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep ordered open polylines; never infer parentheses from proximity alone."""
+    chains: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+
+    def finish() -> None:
+        if 4 <= len(current) <= 64:
+            points = [current[0]['p1']] + [s['p2'] for s in current]
+            if distance(points[0], points[-1]) > 0.2:
+                chains.append({'points': points, 'ids': [s['id'] for s in current],
+                               'color': current[0].get('color')})
+
+    for segment in segments:
+        if current and (segment['path_id'] != current[-1]['path_id'] or
+                        distance(segment['p1'], current[-1]['p2']) > 0.05):
+            finish()
+            current = []
+        current.append(segment)
+    finish()
+    return chains
+
+
+def restore_vector_reference(annotation: dict[str, Any], chains: Sequence[dict[str, Any]]) -> None:
+    """Recover paired bowed vector parentheses in the annotation's rotated frame.
+
+    Exported font boxes can overlap bracket strokes, so tolerate a small inset.
+    Require opposing bows, matching heights, and both ends enclosing this label.
+    """
+    if annotation.get('reference_kind') in {'parentheses', 'ref_and_parentheses'}:
+        return
+    size = max(annotation['font_size'], 4.0)
+    u = annotation['direction']
+    v = (-u[1], u[0])
+    ru = local_range(annotation['bbox'], u)
+    rv = local_range(annotation['bbox'], v)
+    choices: dict[str, list[dict[str, Any]]] = {'open': [], 'close': []}
+    for chain in chains:
+        coords = [(dot(p, u), dot(p, v)) for p in chain['points']]
+        us, vs = [p[0] for p in coords], [p[1] for p in coords]
+        width, height = max(us) - min(us), max(vs) - min(vs)
+        if not (size * .05 <= width <= size * .5 and size * .65 <= height <= size * 1.7):
+            continue
+        if abs((min(vs) + max(vs) - rv[0] - rv[1]) / 2) > size * .35:
+            continue
+        if abs(vs[-1] - vs[0]) < height * .95 or abs(us[-1] - us[0]) > width * .3:
+            continue
+        direction = 1 if vs[-1] > vs[0] else -1
+        if any((b - a) * direction < -.05 for a, b in zip(vs, vs[1:])):
+            continue
+        ends = (us[0] + us[-1]) / 2
+        middle = [(a, b) for a, b in coords if abs(b - (min(vs) + max(vs)) / 2) < height * .2]
+        if not middle:
+            continue
+        bow = sum(p[0] for p in middle) / len(middle) - ends
+        if abs(bow) < width * .7:
+            continue
+        kind = 'open' if bow < 0 else 'close'
+        boundary = ru[0] if kind == 'open' else ru[1]
+        if abs(ends - boundary) > size * .65:
+            continue
+        choices[kind].append({**chain, 'height': height, 'center_v': (min(vs) + max(vs)) / 2,
+                              'end_u': ends})
+    pairs = [(a, b) for a in choices['open'] for b in choices['close']
+             if a['end_u'] < b['end_u'] and a['color'] == b['color']
+             and abs(a['height'] - b['height']) < size * .15
+             and abs(a['center_v'] - b['center_v']) < size * .15]
+    if len(pairs) != 1:
+        return
+    left, right = pairs[0]
+    annotation['text_layer_text'] = annotation['raw_text']
+    annotation['raw_text'] = '(' + annotation['raw_text'] + ')'
+    annotation['normalized_text'] = annotation['raw_text']
+    annotation['reference'] = True
+    annotation['reference_kind'] = 'ref_and_parentheses' if annotation.get('reference_kind') == 'ref' else 'parentheses'
+    annotation['reference_evidence'] = {'basis': 'paired_opposing_vector_bows',
+                                      'segment_ids': left['ids'] + right['ids']}
+    points = left['points'] + right['points']
+    bracket_box = [min(p[0] for p in points), min(p[1] for p in points),
+                   max(p[0] for p in points), max(p[1] for p in points)]
+    annotation['bbox'] = bbox_union([annotation['bbox'], bracket_box])
+
+
 def _frame_leader_evidence(
     frame: Sequence[float], frame_segment_ids: set[str], geometry: PageGeometry
 ) -> tuple[list[str], list[str]]:
@@ -1002,6 +1085,8 @@ def is_root_candidate(token: dict[str, Any]) -> bool:
 
 def fragment_role(text: str) -> str | None:
     value = normalize_text(text)
+    if re.fullmatch(r"REF\.?", value, re.IGNORECASE):
+        return "reference_marker"
     if re.fullmatch(r"[+\-±]", value) or SIGNED_TOL_RE.fullmatch(value):
         return "tolerance"
     if NUMERIC_FRAGMENT_RE.fullmatch(value):
@@ -1200,6 +1285,9 @@ def collect_fragments(
                     continue
             if role == "quantity_prefix" and side > 0:
                 continue
+        elif role == "reference_marker":
+            if side < 0 or along_gap > root_size * 1.2 or abs(vertical) > root_size * 0.45:
+                continue
         elif role in {"unit", "fit"} and side < -root_size:
             continue
         score = along_gap + perpendicular_gap * 1.5 + abs(vertical) * 0.15
@@ -1226,6 +1314,8 @@ def collect_fragments(
                     continue
                 tolerance_signs.add(sign)
         if role == "number" and role_counts.get(role, 0) >= 2:
+            continue
+        if role == "reference_marker" and role_counts.get(role, 0):
             continue
         if role in {"symbol", "unit", "fit", "quantity_prefix"} and role_counts.get(role, 0) >= 2:
             continue
@@ -1821,16 +1911,18 @@ def parse_annotation(
     working = combined
     quantity = 1
     quantity_match = re.match(
-        r"^\s*\(?\s*(\d+)\s*[-×xX]\s*\)?\s*(?=(?:Ø|R|SR|SØ|M|C|□))",
+        rf"^\s*\(?\s*(\d+)\s*[-×xX]\s*\)?\s*(?=(?:Ø|R|SR|SØ|M|C|□|{NUMBER_RE}\s*°))",
         working, re.I,
     )
     if quantity_match:
         quantity = int(quantity_match.group(1))
         working = working[quantity_match.end():]
-    reference = (
-        (working.strip().startswith("(") and working.strip().endswith(")"))
-        or working.rstrip().endswith("*")
-    )
+    has_ref = bool(REF_RE.search(working))
+    reference_text = REF_RE.sub('', working).strip().rstrip('*').rstrip()
+    parenthesized = reference_text.startswith('(') and reference_text.endswith(')')
+    reference = has_ref or parenthesized
+    reference_kind = ('ref_and_parentheses' if has_ref and parenthesized else
+                      'ref' if has_ref else 'parentheses' if parenthesized else 'none')
     upper = working.upper()
     roughness_match = ROUGHNESS_TEXT_RE.fullmatch(working.strip())
     if roughness_match:
@@ -1884,6 +1976,8 @@ def parse_annotation(
             if angle_degrees is not None:
                 nominal = angle_degrees + (angle_minutes or 0.0) / 60.0 + (angle_seconds or 0.0) / 3600.0
                 nominal_text = angle_match.group(0)
+                if quantity_match:
+                    distribution_angle = nominal
     elif dimension_type == "spacing":
         distribution_match = re.search(rf"@\s*({NUMBER_RE})\s*°", working)
         if distribution_match:
@@ -1899,9 +1993,11 @@ def parse_annotation(
         explicit_unit = "deg"
     elif dimension_type == "surface_roughness":
         explicit_unit = "µm"
-    tolerance_upper, tolerance_lower, notes = parse_tolerances(root, fragments, combined)
+    tolerance_upper, tolerance_lower, notes = parse_tolerances(root, fragments, working)
+    if working.rstrip().endswith('*') and not reference:
+        notes.append('unresolved_asterisk_marker')
     tolerance_unit = None
-    tolerance_marker = re.search(rf"(?:±|[+\-])\s*{NUMBER_RE}\s*([°'\"]?)", combined)
+    tolerance_marker = re.search(rf"(?:±|[+\-])\s*{NUMBER_RE}\s*([°'\"]?)", working)
     if tolerance_marker:
         marker_unit = tolerance_marker.group(1)
         if marker_unit == '"' and dimension_type != "angle":
@@ -1964,6 +2060,7 @@ def parse_annotation(
         "tolerance_unit": tolerance_unit,
         "quantity": quantity,
         "reference": reference,
+        "reference_kind": reference_kind,
         "fit": fit_match.group(1) if fit_match else None,
         "thread_pitch": rounded(pitch, 6) if pitch is not None else None,
         "angle_degrees": rounded(angle_degrees, 6) if angle_degrees is not None else None,
@@ -2939,6 +3036,7 @@ def analyze_pdf(input_path: Path, default_unit: str | None = None) -> dict[str, 
             page_rects[page_index] = page_rect
             tokens = extract_text_tokens(page, page_index)
             geometry = extract_vector_geometry(page, page_index)
+            bracket_chains = vector_open_chains(geometry.segments)
             title_block_rect = detect_title_block_rect(geometry, page_rect)
             technical_note_rects = detect_technical_note_rects(
                 tokens, page_rect, title_block_rect
@@ -3032,6 +3130,7 @@ def analyze_pdf(input_path: Path, default_unit: str | None = None) -> dict[str, 
                     ],
                     "context_line_text": root["line_text"],
                 }
+                restore_vector_reference(annotation, bracket_chains)
                 if root["id"] in imperial_clusters:
                     annotation["assembly_basis"] = "quote_anchored_imperial_fraction"
                 elif angular_cluster:
@@ -3108,7 +3207,7 @@ CSV_FIELDS = (
     "id", "page", "status", "review_reason", "raw_text", "type", "nominal_text",
     "nominal", "unit", "tolerance_upper", "tolerance_lower", "tolerance_unit",
     "limit_upper_text", "limit_lower_text", "limit_upper", "limit_lower",
-    "quantity", "reference", "fit", "thread_pitch", "angle_degrees", "angle_minutes",
+    "quantity", "reference", "reference_kind", "fit", "thread_pitch", "angle_degrees", "angle_minutes",
     "angle_seconds", "distribution_angle_deg", "rotation_deg", "bbox", "geometry_relationship",
     "geometry_score", "geometry_unique", "root_token_id", "fragment_token_ids",
     "geometric_characteristic", "characteristic_symbol", "geometric_tolerance",
@@ -3173,7 +3272,20 @@ def write_review_pdf(input_path: Path, output_path: Path, result: dict[str, Any]
             page = document[record["page"] - 1]
             color = (0.0, 0.65, 0.1) if record["status"] == "accepted" else (1.0, 0.45, 0.0)
             rect = fitz.Rect(record["bbox"])
-            page.draw_rect(rect, color=color, width=0.8, overlay=True)
+            box_annotation = page.add_rect_annot(rect)
+            box_annotation.set_colors(stroke=color)
+            box_annotation.set_border(width=0.8)
+            box_annotation.set_info(title=record['id'], content=(
+                f"{record['raw_text']}\nType: {record['type']}\nNominal: {record['nominal']} {record.get('unit') or ''}"
+                f"\nTolerance: {record.get('tolerance_upper')} / {record.get('tolerance_lower')}"
+                f"\nQuantity: {record.get('quantity', 1)}\nReference: {record.get('reference_kind', 'none')}"
+                f"\nRotation: {record.get('rotation_deg')} deg"
+                f"\nStatus: {record['status']}\nReason: {record.get('review_reason') or ''}"
+                + ''.join(f"\n{key}: {record[key]}" for key in (
+                    'tolerance_unit', 'limit_lower', 'limit_upper', 'distribution_angle_deg',
+                    'geometric_characteristic', 'geometric_tolerance', 'tolerance_zone',
+                    'datum_references') if record.get(key) is not None)))
+            box_annotation.update()
             label_y = max(page.rect.y0 + 7, rect.y0 - 2)
             page.insert_text(
                 (rect.x0, label_y), record["id"], fontsize=5.5,
